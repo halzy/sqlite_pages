@@ -1,8 +1,8 @@
 //! `SQLite` page-level I/O library
 //!
-//! This library provides direct access to SQLite's raw database pages. It operates
-//! below SQLite's query layer and is **not** for normal database operations - use
-//! standard SQLite queries for reading and writing data.
+//! This library provides direct access to `SQLite`'s raw database pages. It operates
+//! below `SQLite`'s query layer and is **not** for normal database operations - use
+//! standard `SQLite` queries for reading and writing data.
 //!
 //! # Build Configuration
 //!
@@ -13,17 +13,17 @@
 //! LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_DBPAGE_VTAB"
 //! ```
 //!
-//! Without this flag, operations will fail with "no such table: sqlite_dbpage".
+//! Without this flag, operations will fail with "no such table: `sqlite_dbpage`".
 //!
 //! # Page Numbering
 //!
-//! All page numbers in this API are **1-based** to match SQLite's internal format.
+//! All page numbers in this API are **1-based** to match `SQLite`'s internal format.
 //! The first page is page 1, not page 0.
 //!
 //! # Danger: Database Corruption Risk
 //!
-//! **This API bypasses SQLite's safety mechanisms.** Writing invalid page data will
-//! corrupt your database. Only use this for copying valid pages from another SQLite
+//! **This API bypasses `SQLite`'s safety mechanisms.** Writing invalid page data will
+//! corrupt your database. Only use this for copying valid pages from another `SQLite`
 //! database.
 //!
 //! # How to Use
@@ -101,15 +101,51 @@ mod async_api;
 mod blocking;
 
 // Re-export for convenience and backward compatibility
-pub use async_api::{AsyncSqliteIo, AsyncTransaction};
-pub use blocking::{SqliteIo, SqliteIoTransaction};
+pub use async_api::AsyncSqliteIo;
+pub use blocking::SqliteIo;
+
+/// A blocking `SQLite` connection in normal mode.
+pub type BlockingConnection = SqliteIo<Normal<rusqlite::Connection>>;
+
+/// A blocking `SQLite` connection in transaction mode.
+pub type BlockingTransaction = SqliteIo<InTransaction<rusqlite::Connection>>;
+
+/// An async `SQLite` connection in normal mode.
+pub type AsyncConnection = AsyncSqliteIo<async_api::AsyncNormal>;
+
+/// An async `SQLite` connection in transaction mode.
+pub type AsyncTransaction = AsyncSqliteIo<async_api::AsyncInTransaction>;
+
+/// Marker trait for connection states.
+#[doc(hidden)]
+pub trait ConnectionState {}
+
+/// Normal connection state - not in a transaction.
+#[doc(hidden)]
+pub struct Normal<C> {
+    pub(crate) conn: C,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) started_empty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<C> ConnectionState for Normal<C> {}
+
+/// In-transaction connection state.
+#[doc(hidden)]
+pub struct InTransaction<C> {
+    pub(crate) conn: C,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) set_page_size: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<C> ConnectionState for InTransaction<C> {}
 
 /// The type of transaction to begin.
 ///
-/// SQLite supports three transaction types with different locking behaviors:
+/// `SQLite` supports three transaction types with different locking behaviors:
 ///
 /// - `Deferred`: No lock is acquired until the first read or write operation.
-///   This is the default SQLite behavior but can lead to `SQLITE_BUSY` errors
+///   This is the default `SQLite` behavior but can lead to `SQLITE_BUSY` errors
 ///   if another connection acquires a write lock before you do.
 ///
 /// - `Immediate`: Acquires a write lock immediately, preventing other connections
@@ -132,7 +168,7 @@ pub enum TransactionType {
 
 impl TransactionType {
     /// Returns the SQL statement to begin this type of transaction.
-    fn as_sql(&self) -> &'static str {
+    fn as_sql(self) -> &'static str {
         match self {
             TransactionType::Deferred => "BEGIN DEFERRED",
             TransactionType::Immediate => "BEGIN IMMEDIATE",
@@ -169,6 +205,12 @@ pub enum Error {
 
     #[snafu(display("Join error: {}", source))]
     Join { source: tokio::task::JoinError },
+
+    #[snafu(display("Async connection mutex was poisoned"))]
+    MutexPoisoned,
+
+    #[snafu(display("Async connection inner value was already taken"))]
+    InnerAlreadyTaken,
 }
 
 /// Represents a single database page.
@@ -313,6 +355,82 @@ mod tests {
         assert_eq!(start, 5);
         assert_eq!(end, 5);
     }
+
+    #[test]
+    fn test_resolve_page_range_excluded_start() {
+        // Test Bound::Excluded for start (uses + 1)
+        use std::ops::Bound;
+        let range = (Bound::Excluded(5), Bound::Included(10));
+        let (start, end) = resolve_page_range(range, 100);
+        assert_eq!(start, 6); // 5 + 1
+        assert_eq!(end, 10);
+    }
+
+    #[test]
+    fn test_page_is_empty() {
+        let empty_page = Page::new(1, vec![]);
+        assert!(empty_page.is_empty());
+
+        let non_empty_page = Page::new(1, vec![0u8; 10]);
+        assert!(!non_empty_page.is_empty());
+    }
+
+    #[test]
+    fn test_page_debug_fmt() {
+        let page = Page::new(42, vec![0u8; 4096]);
+        let debug_str = format!("{:?}", page);
+        assert!(debug_str.contains("Page"));
+        assert!(debug_str.contains("42"));
+        assert!(debug_str.contains("4096 bytes"));
+    }
+
+    #[test]
+    fn test_configure_db_connection() {
+        use rusqlite::config::DbConfig;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("config_test.db");
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        // This should succeed and actually configure the connection
+        configure_db_connection(&conn, &db_path).unwrap();
+
+        // Verify the configuration was actually applied by checking the settings
+        let writable_schema = conn
+            .db_config(DbConfig::SQLITE_DBCONFIG_WRITABLE_SCHEMA)
+            .unwrap();
+        assert!(writable_schema, "writable_schema should be enabled");
+
+        let attach_create = conn
+            .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_ATTACH_CREATE)
+            .unwrap();
+        assert!(attach_create, "attach_create should be enabled");
+
+        let attach_write = conn
+            .db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_ATTACH_WRITE)
+            .unwrap();
+        assert!(attach_write, "attach_write should be enabled");
+    }
+
+    #[test]
+    fn test_open_and_attach_empty_vs_non_empty() {
+        let tempdir = tempfile::tempdir().unwrap();
+
+        // Test with non-existent (empty) database
+        let empty_path = tempdir.path().join("empty.db");
+        let (_, started_empty) = open_and_attach(&empty_path).unwrap();
+        assert!(started_empty, "New database should start empty");
+
+        // Test with existing database that has content
+        let existing_path = tempdir.path().join("existing.db");
+        {
+            let conn = rusqlite::Connection::open(&existing_path).unwrap();
+            conn.execute("CREATE TABLE test (id INTEGER)", []).unwrap();
+        }
+        let (_, started_empty) = open_and_attach(&existing_path).unwrap();
+        assert!(!started_empty, "Existing database should not be empty");
+    }
 }
 
 pub(crate) fn get_page_data(conn: &Connection, page_number: usize) -> Result<Page, Error> {
@@ -338,7 +456,10 @@ pub(crate) fn max_dbpage(conn: &Connection) -> Result<usize, Error> {
 }
 
 /// Configures the database connection with required settings for page-level access.
-pub(crate) fn configure_db_connection(conn: &Connection, path: &PathBuf) -> Result<(), Error> {
+pub(crate) fn configure_db_connection(
+    conn: &Connection,
+    path: &std::path::Path,
+) -> Result<(), Error> {
     let configs = [
         (DbConfig::SQLITE_DBCONFIG_WRITABLE_SCHEMA, "writable schema"),
         (
@@ -354,7 +475,9 @@ pub(crate) fn configure_db_connection(conn: &Connection, path: &PathBuf) -> Resu
     for (config, name) in configs {
         let enabled = conn
             .set_db_config(config, true)
-            .with_context(|_| OpenDatabaseSnafu { path: path.clone() })?;
+            .with_context(|_| OpenDatabaseSnafu {
+                path: path.to_path_buf(),
+            })?;
         assert!(enabled, "{name} should be enabled");
     }
 
@@ -388,9 +511,10 @@ pub(crate) fn resolve_page_range(range: impl RangeBounds<usize>, max: usize) -> 
 /// Opens a connection and attaches a database for page-level access.
 ///
 /// Returns the connection and whether the database started empty.
-pub(crate) fn open_and_attach(path: &PathBuf) -> Result<(Connection, bool), Error> {
-    let conn =
-        Connection::open_in_memory().with_context(|_| OpenDatabaseSnafu { path: path.clone() })?;
+pub(crate) fn open_and_attach(path: &std::path::Path) -> Result<(Connection, bool), Error> {
+    let conn = Connection::open_in_memory().with_context(|_| OpenDatabaseSnafu {
+        path: path.to_path_buf(),
+    })?;
 
     // Configure database with required settings
     configure_db_connection(&conn, path)?;
@@ -399,7 +523,9 @@ pub(crate) fn open_and_attach(path: &PathBuf) -> Result<(Connection, bool), Erro
         "ATTACH :path AS 'target'",
         named_params! {":path": path.to_string_lossy().as_ref()},
     )
-    .with_context(|_| OpenDatabaseSnafu { path: path.clone() })?;
+    .with_context(|_| OpenDatabaseSnafu {
+        path: path.to_path_buf(),
+    })?;
 
     // Make it so that we can modify the database schema with page updates
     conn.pragma_update(None, "writable_schema", "ON")

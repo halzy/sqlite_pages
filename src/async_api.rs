@@ -1,48 +1,113 @@
-//! Asynchronous API for page-level SQLite access using tokio.
+//! Asynchronous API for page-level `SQLite` access using tokio.
 
-use std::{
-    ops::RangeBounds,
-    path::{Path, PathBuf},
-    sync::{atomic::AtomicBool, Arc},
-};
+use std::{ops::RangeBounds, path::Path, sync::Mutex};
 
-use rusqlite::Connection;
-use snafu::ResultExt as _;
-use tokio::sync::Mutex;
+use snafu::{OptionExt as _, ResultExt as _};
 
 use crate::{
-    get_page_data, max_dbpage, open_and_attach, page_map_impl, set_page_data_with_size, Error,
-    JoinSnafu, Page, TransactionSnafu, TransactionType,
+    blocking::SqliteIo, Error, InTransaction, InnerAlreadyTakenSnafu, JoinSnafu,
+    MutexPoisonedSnafu, Normal, Page, TransactionType,
+};
+
+/// Async connection state trait.
+#[doc(hidden)]
+pub trait AsyncConnectionState {}
+
+/// Generic async state wrapper that provides take/put/into_inner operations.
+#[doc(hidden)]
+pub struct AsyncState<T> {
+    inner: Mutex<Option<T>>,
+}
+
+impl<T> AsyncState<T> {
+    fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(Some(value)),
+        }
+    }
+
+    fn take(&self) -> Result<T, Error> {
+        self.inner
+            .lock()
+            .ok()
+            .context(MutexPoisonedSnafu)?
+            .take()
+            .context(InnerAlreadyTakenSnafu)
+    }
+
+    fn put(&self, value: T) -> Result<(), Error> {
+        *self.inner.lock().ok().context(MutexPoisonedSnafu)? = Some(value);
+        Ok(())
+    }
+
+    fn into_inner(self) -> Result<T, Error> {
+        self.inner
+            .into_inner()
+            .ok()
+            .context(MutexPoisonedSnafu)?
+            .context(InnerAlreadyTakenSnafu)
+    }
+}
+
+/// Normal async connection state - wraps a blocking connection.
+#[doc(hidden)]
+pub type AsyncNormal = AsyncState<SqliteIo<Normal<rusqlite::Connection>>>;
+
+impl AsyncConnectionState for AsyncNormal {}
+
+/// In-transaction async connection state - wraps a blocking transaction.
+#[doc(hidden)]
+pub type AsyncInTransaction = AsyncState<SqliteIo<InTransaction<rusqlite::Connection>>>;
+
+impl AsyncConnectionState for AsyncInTransaction {}
+
+// Static assertions to ensure async types are Send + Sync
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    const fn assert_sync<T: Sync>() {}
+
+    assert_send::<AsyncSqliteIo<AsyncNormal>>();
+    assert_sync::<AsyncSqliteIo<AsyncNormal>>();
+    assert_send::<AsyncSqliteIo<AsyncInTransaction>>();
+    assert_sync::<AsyncSqliteIo<AsyncInTransaction>>();
 };
 
 /// Async interface for page-level `SQLite` database access.
 ///
-/// This struct wraps a `SQLite` connection in an `Arc<Mutex<>>` allowing it to be
-/// cloned and shared across async tasks. All blocking SQLite operations are executed
-/// via `tokio::task::spawn_blocking`.
+/// This struct wraps the blocking `SqliteIo` and executes all blocking `SQLite`
+/// operations via `tokio::task::spawn_blocking`.
 ///
 /// # Important Notes
 ///
 /// - The connection is opened in-memory, and the actual database file is attached
 /// - All page operations use the 'target' schema name
 /// - The connection is configured with special permissions for page-level access
-/// - This struct is `Clone` and can be shared across tasks
-#[derive(Clone)]
-pub struct AsyncSqliteIo {
-    conn: Arc<Mutex<Connection>>,
-    path: PathBuf,
-    started_empty: Arc<AtomicBool>,
+///
+/// # Typestate Pattern
+///
+/// This connection uses a typestate pattern. When you start a transaction with
+/// [`transaction`](AsyncSqliteIo::transaction), the connection moves to the
+/// `AsyncInTransaction` state. You must call `commit()` or `rollback()` to
+/// return to the normal state.
+pub struct AsyncSqliteIo<S: AsyncConnectionState> {
+    state: S,
 }
 
-impl std::fmt::Debug for AsyncSqliteIo {
+impl std::fmt::Debug for AsyncSqliteIo<AsyncNormal> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AsyncSqliteIo")
-            .field("path", &self.path)
+        f.debug_struct("AsyncSqliteIo").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AsyncSqliteIo<AsyncInTransaction> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncSqliteIo<InTransaction>")
             .finish_non_exhaustive()
     }
 }
 
-impl AsyncSqliteIo {
+#[allow(clippy::missing_panics_doc)]
+impl AsyncSqliteIo<AsyncNormal> {
     /// Opens a database for page-level access asynchronously.
     ///
     /// This creates an in-memory `SQLite` connection and attaches the database
@@ -62,29 +127,29 @@ impl AsyncSqliteIo {
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self, Error> {
         let path = db_path.as_ref().to_path_buf();
 
-        let path_clone = path.clone();
-        let (conn, started_empty) =
-            tokio::task::spawn_blocking(move || open_and_attach(&path_clone))
-                .await
-                .with_context(|_| JoinSnafu)??;
+        let inner = tokio::task::spawn_blocking(move || SqliteIo::new(&path))
+            .await
+            .with_context(|_| JoinSnafu)??;
 
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            path,
-            started_empty: Arc::new(AtomicBool::new(started_empty)),
+            state: AsyncState::new(inner),
         })
     }
 
     /// Starts a new async transaction for page modifications.
     ///
-    /// The transaction holds the connection lock for its entire lifetime.
-    /// All operations on the transaction are async and use `spawn_blocking` internally.
-    /// You must call `commit()` to persist changes; dropping without commit will rollback.
+    /// This method consumes the connection and returns it in transaction mode.
+    /// You must call `commit()` or `rollback()` on the returned connection
+    /// to get back to normal mode.
     ///
     /// # Arguments
     ///
     /// * `transaction_type` - The type of transaction to begin. Use `TransactionType::Immediate`
     ///   (the default) for write operations to avoid `SQLITE_BUSY` errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be started.
     ///
     /// # Example
     ///
@@ -107,37 +172,22 @@ impl AsyncSqliteIo {
     /// // Can await between operations
     /// let page = tx.get_page_data(1).await?;
     /// tx.set_page_data(1, page.data()).await?;
-    /// tx.commit().await?;
+    /// let db = tx.commit().await?;  // Returns connection back to normal mode
     /// # Ok(())
     /// # }
     /// ```
     pub async fn transaction(
-        &self,
+        self,
         transaction_type: TransactionType,
-    ) -> Result<AsyncTransaction, Error> {
-        let conn = Arc::clone(&self.conn);
-        let started_empty = Arc::clone(&self.started_empty);
+    ) -> Result<AsyncSqliteIo<AsyncInTransaction>, Error> {
+        let inner = self.state.into_inner()?;
 
-        // Start transaction in blocking context
-        tokio::task::spawn_blocking({
-            let conn_clone = Arc::clone(&conn);
-            move || {
-                let guard = conn_clone.blocking_lock();
+        let tx_inner = tokio::task::spawn_blocking(move || inner.transaction(transaction_type))
+            .await
+            .with_context(|_| JoinSnafu)??;
 
-                guard
-                    .execute(transaction_type.as_sql(), [])
-                    .with_context(|_| TransactionSnafu)?;
-
-                Ok::<_, Error>(())
-            }
-        })
-        .await
-        .with_context(|_| JoinSnafu)??;
-
-        Ok(AsyncTransaction {
-            conn,
-            set_page_size: started_empty,
-            committed: false,
+        Ok(AsyncSqliteIo {
+            state: AsyncState::new(tx_inner),
         })
     }
 
@@ -161,14 +211,17 @@ impl AsyncSqliteIo {
         R: RangeBounds<usize> + Send + 'static,
         F: FnMut(usize, &[u8]) + Send + 'static,
     {
-        let conn = Arc::clone(&self.conn);
+        let inner = self.state.take()?;
 
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
-            page_map_impl(&*guard, range, fun)
+        let (result, inner) = tokio::task::spawn_blocking(move || {
+            let result = inner.page_map(range, fun);
+            (result, inner)
         })
         .await
-        .with_context(|_| JoinSnafu)?
+        .with_context(|_| JoinSnafu)?;
+
+        self.state.put(inner)?;
+        result
     }
 
     /// Returns the number of pages in the database.
@@ -177,29 +230,22 @@ impl AsyncSqliteIo {
     ///
     /// Returns an error if the page count cannot be retrieved.
     pub async fn page_count(&self) -> Result<usize, Error> {
-        let conn = Arc::clone(&self.conn);
+        let inner = self.state.take()?;
 
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
-            max_dbpage(&*guard)
+        let (result, inner) = tokio::task::spawn_blocking(move || {
+            let result = inner.page_count();
+            (result, inner)
         })
         .await
-        .with_context(|_| JoinSnafu)?
+        .with_context(|_| JoinSnafu)?;
+
+        self.state.put(inner)?;
+        result
     }
 }
 
-/// An async transaction for page modifications.
-///
-/// This transaction holds the connection lock and provides async methods for
-/// reading and writing pages. Each operation uses `spawn_blocking` internally.
-/// You must call `commit()` to persist changes; dropping without commit will rollback.
-pub struct AsyncTransaction {
-    conn: Arc<Mutex<Connection>>,
-    set_page_size: Arc<AtomicBool>,
-    committed: bool,
-}
-
-impl AsyncTransaction {
+#[allow(clippy::missing_panics_doc)]
+impl AsyncSqliteIo<AsyncInTransaction> {
     /// Sets the data for a specific page in the database.
     ///
     /// # Arguments
@@ -211,16 +257,18 @@ impl AsyncTransaction {
     ///
     /// Returns an error if the page data cannot be written to the database.
     pub async fn set_page_data(&self, page_number: usize, data: &[u8]) -> Result<(), Error> {
-        let conn = Arc::clone(&self.conn);
         let data = data.to_vec();
-        let set_page_size = Arc::clone(&self.set_page_size);
+        let mut inner = self.state.take()?;
 
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
-            set_page_data_with_size(&*guard, page_number, &data, &set_page_size)
+        let (result, inner) = tokio::task::spawn_blocking(move || {
+            let result = inner.set_page_data(page_number, &data);
+            (result, inner)
         })
         .await
-        .with_context(|_| JoinSnafu)?
+        .with_context(|_| JoinSnafu)?;
+
+        self.state.put(inner)?;
+        result
     }
 
     /// Retrieves the data for a specific page from the database.
@@ -233,70 +281,104 @@ impl AsyncTransaction {
     ///
     /// Returns an error if the page cannot be read from the database.
     pub async fn get_page_data(&self, page_number: usize) -> Result<Page, Error> {
-        let conn = Arc::clone(&self.conn);
+        let inner = self.state.take()?;
 
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
-            get_page_data(&*guard, page_number)
+        let (result, inner) = tokio::task::spawn_blocking(move || {
+            let result = inner.get_page_data(page_number);
+            (result, inner)
         })
         .await
-        .with_context(|_| JoinSnafu)?
+        .with_context(|_| JoinSnafu)?;
+
+        self.state.put(inner)?;
+        result
+    }
+
+    /// Returns the number of pages in the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the page count cannot be retrieved.
+    pub async fn page_count(&self) -> Result<usize, Error> {
+        let inner = self.state.take()?;
+
+        let (result, inner) = tokio::task::spawn_blocking(move || {
+            let result = inner.page_count();
+            (result, inner)
+        })
+        .await
+        .with_context(|_| JoinSnafu)?;
+
+        self.state.put(inner)?;
+        result
+    }
+
+    /// Maps a function over database pages in the specified range asynchronously.
+    ///
+    /// Page numbers are **1-based** (the first page is page 1, not page 0).
+    ///
+    /// # Arguments
+    ///
+    /// * `range` - A range of page numbers (1-based) to process
+    /// * `fun` - A function that receives the page number (1-based) and page data for each page
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the range is invalid or pages cannot be read.
+    pub async fn page_map<R, F>(&self, range: R, fun: F) -> Result<(), Error>
+    where
+        R: RangeBounds<usize> + Send + 'static,
+        F: FnMut(usize, &[u8]) + Send + 'static,
+    {
+        let inner = self.state.take()?;
+
+        let (result, inner) = tokio::task::spawn_blocking(move || {
+            let result = inner.page_map(range, fun);
+            (result, inner)
+        })
+        .await
+        .with_context(|_| JoinSnafu)?;
+
+        self.state.put(inner)?;
+        result
     }
 
     /// Commits the transaction, persisting all changes to the database.
     ///
+    /// Returns the connection back to normal mode.
+    ///
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
-    pub async fn commit(mut self) -> Result<(), Error> {
-        let conn = Arc::clone(&self.conn);
+    pub async fn commit(self) -> Result<AsyncSqliteIo<AsyncNormal>, Error> {
+        let inner = self.state.into_inner()?;
 
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
-            guard
-                .execute("COMMIT", [])
-                .with_context(|_| TransactionSnafu)
+        let normal_inner = tokio::task::spawn_blocking(move || inner.commit())
+            .await
+            .with_context(|_| JoinSnafu)??;
+
+        Ok(AsyncSqliteIo {
+            state: AsyncState::new(normal_inner),
         })
-        .await
-        .with_context(|_| JoinSnafu)??;
-
-        self.committed = true;
-        Ok(())
     }
 
     /// Rolls back the transaction, discarding all changes.
     ///
+    /// Returns the connection back to normal mode.
+    ///
     /// # Errors
     ///
     /// Returns an error if the rollback fails.
-    pub async fn rollback(mut self) -> Result<(), Error> {
-        let conn = Arc::clone(&self.conn);
+    pub async fn rollback(self) -> Result<AsyncSqliteIo<AsyncNormal>, Error> {
+        let inner = self.state.into_inner()?;
 
-        tokio::task::spawn_blocking(move || {
-            let guard = conn.blocking_lock();
-            guard
-                .execute("ROLLBACK", [])
-                .with_context(|_| TransactionSnafu)
+        let normal_inner = tokio::task::spawn_blocking(move || inner.rollback())
+            .await
+            .with_context(|_| JoinSnafu)??;
+
+        Ok(AsyncSqliteIo {
+            state: AsyncState::new(normal_inner),
         })
-        .await
-        .with_context(|_| JoinSnafu)??;
-
-        self.committed = true; // Mark as handled to prevent double rollback
-        Ok(())
-    }
-}
-
-impl Drop for AsyncTransaction {
-    fn drop(&mut self) {
-        if !self.committed {
-            // Best effort rollback - can't do async in drop
-            let conn = Arc::clone(&self.conn);
-            let _ = std::thread::spawn(move || {
-                let guard = conn.blocking_lock();
-                let _ = guard.execute("ROLLBACK", []);
-            })
-            .join();
-        }
     }
 }
 
@@ -304,116 +386,165 @@ impl Drop for AsyncTransaction {
 mod tests {
     use super::*;
     use crate::TransactionType;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Creates a test database and returns the path
+    fn create_test_db() -> (tempfile::TempDir, PathBuf) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("test.db");
+        let db = crate::blocking::SqliteIo::new(&db_path).unwrap();
+        sqlite_test_utils::init_test_db(db.conn(), "target", 1634, 100, 5).unwrap();
+        (tempdir, db_path)
+    }
 
     #[tokio::test]
-    async fn test_async_new_and_page_map() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let temppath = tempdir.path();
-        let db_path = temppath.join("async_test.db");
-
-        // Create a database first using blocking API
-        {
-            let db = crate::blocking::SqliteIo::new(&db_path).unwrap();
-            sqlite_test_utils::init_test_db(&db.conn, "target", 1634, 100, 5).unwrap();
-        }
-
-        // Now test the async API
+    async fn test_multiple_operations_on_normal() {
+        let (_tempdir, db_path) = create_test_db();
         let db = AsyncSqliteIo::new(&db_path).await.unwrap();
 
-        let page_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let page_count_clone = Arc::clone(&page_count);
-        db.page_map(1.., move |_page_num, _data| {
-            page_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Test page_count multiple times (verifies put() works)
+        let count1 = db.page_count().await.unwrap();
+        let count2 = db.page_count().await.unwrap();
+        assert_eq!(count1, count2);
+        assert!(count1 >= 2);
+
+        // Test page_map
+        let pages = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pages_clone = std::sync::Arc::clone(&pages);
+        db.page_map(1.., move |_, _| {
+            pages_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })
         .await
         .unwrap();
+        assert!(pages.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    }
 
-        assert!(
-            page_count.load(std::sync::atomic::Ordering::SeqCst) > 0,
-            "Should have read some pages"
+    #[tokio::test]
+    async fn test_transaction_commit_and_persist() {
+        let (_tempdir, db_path) = create_test_db();
+        let db = AsyncSqliteIo::new(&db_path).await.unwrap();
+
+        // Write data and commit
+        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
+        let test_data = vec![0xABu8; 4096];
+        tx.set_page_data(2, &test_data).await.unwrap();
+        let read_back = tx.get_page_data(2).await.unwrap();
+        assert_eq!(read_back.data(), &test_data[..]);
+        let db = tx.commit().await.unwrap();
+
+        // Verify persistence
+        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
+        let after = tx.get_page_data(2).await.unwrap();
+        assert_eq!(after.data(), &test_data[..]);
+        let _db = tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_transaction_rollback() {
+        let (_tempdir, db_path) = create_test_db();
+        let db = AsyncSqliteIo::new(&db_path).await.unwrap();
+
+        // Get original data
+        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
+        let original = tx.get_page_data(1).await.unwrap();
+        let db = tx.commit().await.unwrap();
+
+        // Modify and rollback
+        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
+        tx.set_page_data(1, &vec![0u8; 4096]).await.unwrap();
+        let db = tx.rollback().await.unwrap();
+
+        // Verify unchanged
+        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
+        let after = tx.get_page_data(1).await.unwrap();
+        assert_eq!(original.data(), after.data());
+        let _db = tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_transaction_types() {
+        let (_tempdir, db_path) = create_test_db();
+
+        // Test all transaction types
+        for tx_type in [
+            TransactionType::Deferred,
+            TransactionType::Immediate,
+            TransactionType::Exclusive,
+        ] {
+            let db = AsyncSqliteIo::new(&db_path).await.unwrap();
+            let tx = db.transaction(tx_type).await.unwrap();
+            let _count = tx.page_count().await.unwrap();
+            let _db = tx.commit().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transaction_page_map_and_count() {
+        let (_tempdir, db_path) = create_test_db();
+        let db = AsyncSqliteIo::new(&db_path).await.unwrap();
+        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
+
+        // Test page_count on transaction
+        let count = tx.page_count().await.unwrap();
+        assert!(count >= 2);
+
+        // Test page_map on transaction
+        let mapped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mapped_clone = std::sync::Arc::clone(&mapped);
+        tx.page_map(1.., move |_, _| {
+            mapped_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+        assert_eq!(mapped.load(std::sync::atomic::Ordering::SeqCst), count);
+        let _db = tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_debug_fmt() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("debug.db");
+
+        let db = AsyncSqliteIo::new(&db_path).await.unwrap();
+        assert!(format!("{:?}", db).contains("AsyncSqliteIo"));
+
+        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
+        assert!(format!("{:?}", tx).contains("InTransaction"));
+        let _db = tx.commit().await.unwrap();
+    }
+
+    #[test]
+    fn test_mutex_poisoned_error() {
+        let state: AsyncNormal = AsyncState::new(
+            crate::blocking::SqliteIo::new(tempfile::tempdir().unwrap().path().join("poison.db"))
+                .unwrap(),
         );
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.inner.lock().unwrap();
+            panic!("poison mutex");
+        }));
+
+        assert!(matches!(state.take().unwrap_err(), Error::MutexPoisoned));
     }
 
-    #[tokio::test]
-    async fn test_async_begin_transaction() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let temppath = tempdir.path();
-        let db_path = temppath.join("async_tx_test.db");
+    #[test]
+    fn test_inner_already_taken_error() {
+        let state: AsyncNormal = AsyncState {
+            inner: Mutex::new(None),
+        };
+        assert!(matches!(
+            state.take().unwrap_err(),
+            Error::InnerAlreadyTaken
+        ));
 
-        // Create a database first
-        {
-            let db = crate::blocking::SqliteIo::new(&db_path).unwrap();
-            sqlite_test_utils::init_test_db(&db.conn, "target", 1634, 100, 5).unwrap();
-        }
-
-        let db = AsyncSqliteIo::new(&db_path).await.unwrap();
-
-        // Test reading and writing in a transaction
-        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
-        let page = tx.get_page_data(1).await.unwrap();
-        assert_eq!(page.len(), 4096);
-        tx.set_page_data(1, page.data()).await.unwrap();
-        tx.commit().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_async_transaction_rollback_on_drop() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let temppath = tempdir.path();
-        let db_path = temppath.join("async_rollback_test.db");
-
-        // Create a database first
-        {
-            let db = crate::blocking::SqliteIo::new(&db_path).unwrap();
-            sqlite_test_utils::init_test_db(&db.conn, "target", 1634, 100, 5).unwrap();
-        }
-
-        let db = AsyncSqliteIo::new(&db_path).await.unwrap();
-
-        // Get original page data
-        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
-        let original_page = tx.get_page_data(1).await.unwrap();
-        tx.commit().await.unwrap();
-
-        // Modify but don't commit
-        {
-            let tx = db.transaction(TransactionType::Immediate).await.unwrap();
-            let empty = vec![0u8; 4096];
-            tx.set_page_data(1, &empty).await.unwrap();
-            // No commit - should rollback on drop
-        }
-
-        // Verify data unchanged
-        let tx = db.transaction(TransactionType::Immediate).await.unwrap();
-        let after_page = tx.get_page_data(1).await.unwrap();
-        tx.commit().await.unwrap();
-
-        assert_eq!(
-            original_page.data(),
-            after_page.data(),
-            "Data should be unchanged after rollback"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_async_clone_and_share() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let temppath = tempdir.path();
-        let db_path = temppath.join("async_clone_test.db");
-
-        // Create a database first
-        {
-            let db = crate::blocking::SqliteIo::new(&db_path).unwrap();
-            sqlite_test_utils::init_test_db(&db.conn, "target", 1634, 100, 5).unwrap();
-        }
-
-        let db = AsyncSqliteIo::new(&db_path).await.unwrap();
-        let db_clone = db.clone();
-
-        // Use both handles
-        let max1 = db.page_count().await.unwrap();
-        let max2 = db_clone.page_count().await.unwrap();
-
-        assert_eq!(max1, max2);
+        let state: AsyncInTransaction = AsyncState {
+            inner: Mutex::new(None),
+        };
+        assert!(matches!(
+            state.take().unwrap_err(),
+            Error::InnerAlreadyTaken
+        ));
     }
 }
