@@ -1,0 +1,476 @@
+//! `SQLite` page-level I/O library
+//!
+//! This library provides direct access to SQLite's raw database pages. It operates
+//! below SQLite's query layer and is **not** for normal database operations - use
+//! standard SQLite queries for reading and writing data.
+//!
+//! # Build Configuration
+//!
+//! Add the following to your `.cargo/config.toml`:
+//!
+//! ```toml
+//! [env]
+//! LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_DBPAGE_VTAB"
+//! ```
+//!
+//! Without this flag, operations will fail with "no such table: sqlite_dbpage".
+//!
+//! # Page Numbering
+//!
+//! All page numbers in this API are **1-based** to match SQLite's internal format.
+//! The first page is page 1, not page 0.
+//!
+//! # Danger: Database Corruption Risk
+//!
+//! **This API bypasses SQLite's safety mechanisms.** Writing invalid page data will
+//! corrupt your database. Only use this for copying valid pages from another SQLite
+//! database.
+//!
+//! # How to Use
+//!
+//! ## Reading Pages
+//!
+//! ```
+//! use sqlite_pages::SqliteIo;
+//!
+//! # let tempdir = tempfile::tempdir()?;
+//! # let db_path = tempdir.path().join("source.db");
+//! # rusqlite::Connection::open(&db_path)?.execute("CREATE TABLE t (id INTEGER)", [])?;
+//! let db = SqliteIo::new(&db_path)?;
+//!
+//! // Iterate over all pages
+//! db.page_map(.., |page_num, data| {
+//!     println!("Page {}: {} bytes", page_num, data.len());
+//! })?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! ## Writing Pages
+//!
+//! ```
+//! use sqlite_pages::{SqliteIo, TransactionType};
+//!
+//! # let tempdir = tempfile::tempdir()?;
+//! # let db_path = tempdir.path().join("target.db");
+//! let db = SqliteIo::new(&db_path)?;
+//! let mut tx = db.transaction(TransactionType::Immediate)?;
+//!
+//! # let pages: Vec<(usize, Vec<u8>)> = vec![];
+//! for (page_num, data) in pages {
+//!     tx.set_page_data(page_num, &data)?;
+//! }
+//!
+//! tx.commit()?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! ## Async API
+//!
+//! For async contexts, use [`AsyncSqliteIo`]:
+//!
+//! ```
+//! use sqlite_pages::{AsyncSqliteIo, TransactionType};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! # let tempdir = tempfile::tempdir()?;
+//! # let db_path = tempdir.path().join("target.db");
+//! let db = AsyncSqliteIo::new(&db_path).await?;
+//! let tx = db.transaction(TransactionType::Immediate).await?;
+//!
+//! # let page_data = vec![0u8; 4096];
+//! tx.set_page_data(1, &page_data).await?;
+//! tx.commit().await?;
+//! # Ok(())
+//! # }
+//! ```
+
+use std::{
+    ops::{Bound, RangeBounds},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+
+use rusqlite::{config::DbConfig, named_params, params, Connection};
+use snafu::{ResultExt as _, Snafu};
+
+mod async_api;
+mod blocking;
+
+// Re-export for convenience and backward compatibility
+pub use async_api::{AsyncSqliteIo, AsyncTransaction};
+pub use blocking::{SqliteIo, SqliteIoTransaction};
+
+/// The type of transaction to begin.
+///
+/// SQLite supports three transaction types with different locking behaviors:
+///
+/// - `Deferred`: No lock is acquired until the first read or write operation.
+///   This is the default SQLite behavior but can lead to `SQLITE_BUSY` errors
+///   if another connection acquires a write lock before you do.
+///
+/// - `Immediate`: Acquires a write lock immediately, preventing other connections
+///   from writing. Other connections can still read. This is recommended for
+///   transactions that will perform writes.
+///
+/// - `Exclusive`: Acquires an exclusive lock immediately, preventing other
+///   connections from both reading and writing. Use this when you need complete
+///   isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransactionType {
+    /// Deferred transaction - lock acquired on first access
+    Deferred,
+    /// Immediate transaction - write lock acquired immediately (recommended for writes)
+    #[default]
+    Immediate,
+    /// Exclusive transaction - exclusive lock acquired immediately
+    Exclusive,
+}
+
+impl TransactionType {
+    /// Returns the SQL statement to begin this type of transaction.
+    fn as_sql(&self) -> &'static str {
+        match self {
+            TransactionType::Deferred => "BEGIN DEFERRED",
+            TransactionType::Immediate => "BEGIN IMMEDIATE",
+            TransactionType::Exclusive => "BEGIN EXCLUSIVE",
+        }
+    }
+}
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to open database {}: {}", path.display(), source))]
+    OpenDatabase {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
+
+    #[snafu(display("Transaction failed: {}", source))]
+    Transaction { source: rusqlite::Error },
+
+    #[snafu(display("SQL error: {}", source))]
+    Sql { source: rusqlite::Error },
+
+    #[snafu(display("Failed to update page: {}", source))]
+    UpdatePage { source: rusqlite::Error },
+
+    #[snafu(display("Failed to get page: {}", source))]
+    GetPage { source: rusqlite::Error },
+
+    #[snafu(display("Schema error: {}", source))]
+    Schema { source: rusqlite::Error },
+
+    #[snafu(display("Invalid page range: start={} end={}", start, end))]
+    InvalidRange { start: usize, end: usize },
+
+    #[snafu(display("Join error: {}", source))]
+    Join { source: tokio::task::JoinError },
+}
+
+/// Represents a single database page.
+///
+/// A page contains both its page number and the raw binary data.
+/// Page numbers are **1-based** (the first page is page 1, not page 0).
+/// Page sizes are typically 4096 bytes for `SQLite` databases but can vary
+/// depending on the database configuration.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Page {
+    /// The page number (1-based: first page is 1)
+    pub number: usize,
+    /// The raw page data (typically 4096 bytes for `SQLite`)
+    pub data: Vec<u8>,
+}
+
+impl std::fmt::Debug for Page {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Page")
+            .field("number", &self.number)
+            .field("data", &format!("[{} bytes]", self.data.len()))
+            .finish()
+    }
+}
+
+impl Page {
+    /// Create a new Page
+    #[must_use]
+    pub fn new(number: usize, data: Vec<u8>) -> Self {
+        Page { number, data }
+    }
+
+    /// Get the page number
+    #[must_use]
+    pub fn number(&self) -> usize {
+        self.number
+    }
+
+    /// Get the page data
+    #[must_use]
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Get the length of the page data
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Check if the page data is empty
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+// Internal helper functions shared between blocking and async modules
+
+pub(crate) fn set_page_data(
+    conn: &Connection,
+    page_number: usize,
+    data: &[u8],
+) -> Result<(), Error> {
+    let mut stmt = conn
+        .prepare_cached("INSERT INTO sqlite_dbpage (pgno, data, schema) values (?,?,'target');")
+        .with_context(|_| SqlSnafu)?;
+
+    let changed = stmt
+        .execute(params![page_number, data])
+        .with_context(|_| UpdatePageSnafu)?;
+
+    assert_eq!(changed, 1);
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_page_range_inclusive() {
+        // 1..=10 with max 100
+        let (start, end) = resolve_page_range(1..=10, 100);
+        assert_eq!(start, 1);
+        assert_eq!(end, 10);
+    }
+
+    #[test]
+    fn test_resolve_page_range_exclusive() {
+        // 1..10 with max 100
+        let (start, end) = resolve_page_range(1..10, 100);
+        assert_eq!(start, 1);
+        assert_eq!(end, 9);
+    }
+
+    #[test]
+    fn test_resolve_page_range_from() {
+        // 5.. with max 100
+        let (start, end) = resolve_page_range(5.., 100);
+        assert_eq!(start, 5);
+        assert_eq!(end, 100);
+    }
+
+    #[test]
+    fn test_resolve_page_range_to() {
+        // ..20 with max 100
+        let (start, end) = resolve_page_range(..20, 100);
+        assert_eq!(start, 1);
+        assert_eq!(end, 19);
+    }
+
+    #[test]
+    fn test_resolve_page_range_to_inclusive() {
+        // ..=20 with max 100
+        let (start, end) = resolve_page_range(..=20, 100);
+        assert_eq!(start, 1);
+        assert_eq!(end, 20);
+    }
+
+    #[test]
+    fn test_resolve_page_range_full() {
+        // .. with max 100
+        let (start, end) = resolve_page_range(.., 100);
+        assert_eq!(start, 1);
+        assert_eq!(end, 100);
+    }
+
+    #[test]
+    fn test_resolve_page_range_empty_database() {
+        // .. with max 0
+        let (start, end) = resolve_page_range(.., 0);
+        assert_eq!(start, 1);
+        assert_eq!(end, 0);
+    }
+
+    #[test]
+    fn test_resolve_page_range_single_page() {
+        // 5..=5 with max 100
+        let (start, end) = resolve_page_range(5..=5, 100);
+        assert_eq!(start, 5);
+        assert_eq!(end, 5);
+    }
+}
+
+pub(crate) fn get_page_data(conn: &Connection, page_number: usize) -> Result<Page, Error> {
+    let mut stmt = conn
+        .prepare_cached("SELECT data FROM sqlite_dbpage('target') WHERE pgno = ?;")
+        .with_context(|_| SqlSnafu)?;
+
+    let data = stmt
+        .query_row([page_number], |row| row.get(0))
+        .with_context(|_| GetPageSnafu)?;
+
+    Ok(Page::new(page_number, data))
+}
+
+pub(crate) fn max_dbpage(conn: &Connection) -> Result<usize, Error> {
+    let mut max_page = 0;
+    conn.pragma_query(Some("target"), "page_count", |row| {
+        max_page = row.get(0)?;
+        Ok(())
+    })
+    .with_context(|_| SqlSnafu)?;
+    Ok(max_page)
+}
+
+/// Configures the database connection with required settings for page-level access.
+pub(crate) fn configure_db_connection(conn: &Connection, path: &PathBuf) -> Result<(), Error> {
+    let configs = [
+        (DbConfig::SQLITE_DBCONFIG_WRITABLE_SCHEMA, "writable schema"),
+        (
+            DbConfig::SQLITE_DBCONFIG_ENABLE_ATTACH_CREATE,
+            "attach create",
+        ),
+        (
+            DbConfig::SQLITE_DBCONFIG_ENABLE_ATTACH_WRITE,
+            "attach write",
+        ),
+    ];
+
+    for (config, name) in configs {
+        let enabled = conn
+            .set_db_config(config, true)
+            .with_context(|_| OpenDatabaseSnafu { path: path.clone() })?;
+        assert!(enabled, "{name} should be enabled");
+    }
+
+    Ok(())
+}
+
+/// Resolves range bounds into concrete start and end page numbers.
+///
+/// # Arguments
+/// * `range` - The range bounds to resolve
+/// * `max` - The maximum page number (used when end is unbounded)
+///
+/// # Returns
+/// A tuple of (`start_page`, `end_page`)
+pub(crate) fn resolve_page_range(range: impl RangeBounds<usize>, max: usize) -> (usize, usize) {
+    let start = match range.start_bound() {
+        Bound::Included(&n) => n,
+        Bound::Excluded(&n) => n + 1,
+        Bound::Unbounded => 1,
+    };
+
+    let end = match range.end_bound() {
+        Bound::Included(&n) => n,
+        Bound::Excluded(&n) => n.saturating_sub(1),
+        Bound::Unbounded => max,
+    };
+
+    (start, end)
+}
+
+/// Opens a connection and attaches a database for page-level access.
+///
+/// Returns the connection and whether the database started empty.
+pub(crate) fn open_and_attach(path: &PathBuf) -> Result<(Connection, bool), Error> {
+    let conn =
+        Connection::open_in_memory().with_context(|_| OpenDatabaseSnafu { path: path.clone() })?;
+
+    // Configure database with required settings
+    configure_db_connection(&conn, path)?;
+
+    conn.execute(
+        "ATTACH :path AS 'target'",
+        named_params! {":path": path.to_string_lossy().as_ref()},
+    )
+    .with_context(|_| OpenDatabaseSnafu { path: path.clone() })?;
+
+    // Make it so that we can modify the database schema with page updates
+    conn.pragma_update(None, "writable_schema", "ON")
+        .with_context(|_| SchemaSnafu)?;
+
+    let starting_max_page = max_dbpage(&conn)?;
+
+    Ok((conn, starting_max_page == 0))
+}
+
+/// Sets page data with optional page size initialization.
+pub(crate) fn set_page_data_with_size(
+    conn: &Connection,
+    page_number: usize,
+    data: &[u8],
+    set_page_size: &Arc<AtomicBool>,
+) -> Result<(), Error> {
+    if set_page_size.load(Ordering::SeqCst) {
+        let page_size = data.len();
+
+        assert!(
+            page_size.is_power_of_two(),
+            "Page size must be a power of two"
+        );
+
+        assert!(
+            (512..=65536).contains(&page_size),
+            "Page size must be between 512 and 65536 bytes"
+        );
+
+        conn.pragma_update(Some("target"), "page_size", page_size)
+            .with_context(|_| SchemaSnafu)?;
+
+        set_page_size.store(false, Ordering::SeqCst);
+    }
+
+    set_page_data(conn, page_number, data)
+}
+
+/// Maps a function over database pages in the specified range.
+pub(crate) fn page_map_impl<R: RangeBounds<usize>, F: FnMut(usize, &[u8])>(
+    conn: &Connection,
+    range: R,
+    mut fun: F,
+) -> Result<(), Error> {
+    let max_page = max_dbpage(conn)?;
+    let (start_page, end_page) = resolve_page_range(range, max_page);
+
+    // Validate the range
+    if start_page > end_page {
+        return Err(Error::InvalidRange {
+            start: start_page,
+            end: end_page,
+        });
+    }
+
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT pgno, data FROM sqlite_dbpage('target') WHERE pgno >= ?1 AND pgno <= ?2;",
+        )
+        .with_context(|_| SqlSnafu)?;
+
+    let mut rows = stmt
+        .query([start_page, end_page])
+        .with_context(|_| SqlSnafu)?;
+
+    while let Some(row) = rows.next().with_context(|_| SqlSnafu)? {
+        let page = row.get::<_, usize>(0).with_context(|_| SqlSnafu)?;
+        let data = row.get::<_, Vec<u8>>(1).with_context(|_| SqlSnafu)?;
+        fun(page, &data);
+    }
+
+    Ok(())
+}
