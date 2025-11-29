@@ -106,7 +106,6 @@ impl std::fmt::Debug for AsyncSqliteIo<AsyncInTransaction> {
     }
 }
 
-#[allow(clippy::missing_panics_doc)]
 impl AsyncSqliteIo<AsyncNormal> {
     /// Opens a database for page-level access asynchronously.
     ///
@@ -244,7 +243,6 @@ impl AsyncSqliteIo<AsyncNormal> {
     }
 }
 
-#[allow(clippy::missing_panics_doc)]
 impl AsyncSqliteIo<AsyncInTransaction> {
     /// Sets the data for a specific page in the database.
     ///

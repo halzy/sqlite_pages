@@ -1,10 +1,12 @@
 # sqlite_pages
 
-Page-level SQLite database access using the `sqlite_dbpage` virtual table.
+Page-level SQLite database access using the [`sqlite_dbpage`](https://sqlite.org/dbpage.html) virtual table.
 
 ## Overview
 
-This library provides direct access to SQLite's raw database pages. It operates below SQLite's query layer and is **not** for normal database operations - use standard SQLite queries for reading and writing data.
+This library provides direct access to SQLite's raw database pages via the `SQLITE_DBPAGE` virtual table. This virtual table exposes the underlying database file at the page level, allowing reads and writes of raw binary page content through SQLite's pager layer.
+
+This is **not** for normal database operations - use standard SQLite queries for reading and writing data.
 
 ## Build Configuration
 
@@ -72,4 +74,4 @@ tx.commit().await?;
 
 ## License
 
-MIT
+Licensed under either of Apache License, Version 2.0 or MIT license at your option.

@@ -687,6 +687,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::reversed_empty_ranges)]
     fn test_invalid_page_range() {
         let tempdir = tempfile::tempdir().unwrap();
         let temppath = tempdir.path();
@@ -807,6 +808,110 @@ mod tests {
 
         // Rollback also returns a SqliteIo<Normal>
         let _db = tx.rollback().unwrap();
+    }
+
+    #[test]
+    fn test_concurrent_readers() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("concurrent_readers.db");
+
+        // Set up database
+        {
+            let db = SqliteIo::new(&db_path).unwrap();
+            sqlite_test_utils::init_test_db(db.conn(), "target", 1634, 100, 5).unwrap();
+        }
+
+        let db_path = Arc::new(db_path);
+        let mut handles = vec![];
+
+        // Spawn multiple reader threads
+        for i in 0..5 {
+            let db_path = Arc::clone(&db_path);
+            let handle = thread::spawn(move || {
+                let db = SqliteIo::new(db_path.as_ref()).unwrap();
+                let mut count = 0;
+
+                // Each thread reads all pages
+                db.page_map(.., |_num, _data| {
+                    count += 1;
+                })
+                .unwrap();
+
+                (i, count)
+            });
+            handles.push(handle);
+        }
+
+        // All threads should complete successfully
+        for handle in handles {
+            let (thread_id, count) = handle.join().unwrap();
+            assert!(count >= 2, "Thread {} should have read pages", thread_id);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_read_write_isolation() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("concurrent_rw.db");
+
+        // Initialize database
+        {
+            let db = SqliteIo::new(&db_path).unwrap();
+            sqlite_test_utils::init_test_db(db.conn(), "target", 1634, 100, 5).unwrap();
+        }
+
+        let db_path = Arc::new(db_path);
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Writer thread
+        let db_path_writer = Arc::clone(&db_path);
+        let barrier_writer = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            let db = SqliteIo::new(db_path_writer.as_ref()).unwrap();
+            let mut tx = db.transaction(TransactionType::Immediate).unwrap();
+
+            // Signal that we have the write lock
+            barrier_writer.wait();
+
+            // Hold the lock briefly
+            thread::sleep(Duration::from_millis(50));
+
+            let page = tx.get_page_data(1).unwrap();
+            tx.set_page_data(1, page.data()).unwrap();
+            tx.commit().unwrap();
+        });
+
+        // Reader thread
+        let db_path_reader = Arc::clone(&db_path);
+        let barrier_reader = Arc::clone(&barrier);
+        let reader = thread::spawn(move || {
+            // Wait for writer to acquire lock
+            barrier_reader.wait();
+
+            // Give writer time to fully acquire the lock
+            thread::sleep(Duration::from_millis(10));
+
+            // Reader can still open a connection and read
+            let db = SqliteIo::new(db_path_reader.as_ref()).unwrap();
+            let mut count = 0;
+            db.page_map(.., |_, _| {
+                count += 1;
+            })
+            .unwrap();
+            count
+        });
+
+        // Both should complete
+        writer.join().unwrap();
+        let read_count = reader.join().unwrap();
+        assert!(read_count >= 2);
     }
 
     #[test]
