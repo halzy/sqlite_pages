@@ -1,6 +1,6 @@
 [package]
 name = "sqlite_pages"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = true
 description = "Page-level SQLite database access using sqlite_dbpage virtual table"
