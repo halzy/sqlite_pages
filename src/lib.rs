@@ -148,7 +148,7 @@ mod async_api;
 mod blocking;
 
 // Re-export for convenience and backward compatibility
-pub use async_api::{AsyncSqliteIo, AsyncNormal};
+pub use async_api::{AsyncInTransaction, AsyncNormal, AsyncSqliteIo};
 pub use blocking::SqliteIo;
 
 /// Marker trait for connection states.
